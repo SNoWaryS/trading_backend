@@ -1,3 +1,6 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.SqlClient;
 
@@ -7,14 +10,42 @@ var builder = WebApplication.CreateBuilder(args);
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-// Allow the Angular dev server to call this API from the browser.
+// Allow the Angular dev server to call this API from the browser, sending the session cookie.
 builder.Services.AddCors(options =>
     options.AddDefaultPolicy(policy =>
-        policy.WithOrigins("http://localhost:4200").AllowAnyHeader().AllowAnyMethod()));
+        policy.WithOrigins("http://localhost:4200").AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
+
+// Session: an encrypted, HttpOnly cookie set at login. JavaScript cannot read it, and SameSite=Strict
+// keeps other sites from sending it, which also protects the API from cross-site request forgery.
+builder.Services
+    .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.Cookie.Name = "trading_session";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest; // Always use HTTPS in production.
+        options.ExpireTimeSpan = TimeSpan.FromDays(7);
+        options.SlidingExpiration = true;
+        // An API answers 401/403 instead of redirecting to a login page.
+        options.Events.OnRedirectToLogin = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return Task.CompletedTask;
+        };
+        options.Events.OnRedirectToAccessDenied = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return Task.CompletedTask;
+        };
+    });
+builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
 app.UseCors();
+app.UseAuthentication();
+app.UseAuthorization();
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -68,7 +99,7 @@ var passwordHasher = new PasswordHasher<string>();
 // Verified when the username is unknown, so both failures take about the same time.
 var unknownUserHash = passwordHasher.HashPassword(string.Empty, Guid.NewGuid().ToString());
 
-app.MapPost("/api/auth/login", async (LoginRequest request, IConfiguration config, ILogger<Program> logger) =>
+app.MapPost("/api/auth/login", async (LoginRequest request, HttpContext http, IConfiguration config, ILogger<Program> logger) =>
 {
     if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrEmpty(request.Password))
     {
@@ -81,27 +112,42 @@ app.MapPost("/api/auth/login", async (LoginRequest request, IConfiguration confi
         await connection.OpenAsync();
 
         await using var command = new SqlCommand(
-            "SELECT user_id, username, name, surname, password FROM USERS WHERE username = @username",
+            "SELECT user_id, password FROM USERS WHERE username = @username",
             connection);
         command.Parameters.AddWithValue("@username", request.Username);
 
-        await using var reader = await command.ExecuteReaderAsync();
-        var userFound = await reader.ReadAsync();
-        var storedHash = userFound ? reader.GetString(4) : unknownUserHash;
+        int? userId = null;
+        var storedHash = unknownUserHash;
+        await using (var reader = await command.ExecuteReaderAsync())
+        {
+            if (await reader.ReadAsync())
+            {
+                userId = reader.GetInt32(0);
+                storedHash = reader.GetString(1);
+            }
+        }
 
         var verification = passwordHasher.VerifyHashedPassword(string.Empty, storedHash, request.Password);
-        if (!userFound || verification == PasswordVerificationResult.Failed)
+        var profile = userId is int id && verification != PasswordVerificationResult.Failed
+            ? await LoadProfileAsync(connection, id)
+            : null;
+        if (profile is null)
         {
             return Results.Json(new { message = "Incorrect username or password" }, statusCode: StatusCodes.Status401Unauthorized);
         }
 
-        return Results.Ok(new
-        {
-            userId = reader.GetInt32(0),
-            username = reader.GetString(1),
-            name = reader.GetString(2),
-            surname = reader.GetString(3),
-        });
+        var identity = new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.NameIdentifier, profile.UserId.ToString()),
+                new Claim(ClaimTypes.Name, profile.Username),
+            ],
+            CookieAuthenticationDefaults.AuthenticationScheme);
+        await http.SignInAsync(
+            CookieAuthenticationDefaults.AuthenticationScheme,
+            new ClaimsPrincipal(identity),
+            new AuthenticationProperties { IsPersistent = true });
+
+        return Results.Ok(profile);
     }
     catch (SqlException ex)
     {
@@ -174,10 +220,82 @@ app.MapPost("/api/auth/register", async (RegisterRequest request, IConfiguration
 })
 .WithName("Register");
 
+// The logged-in user, from the session cookie. 401 when there is no valid session.
+app.MapGet("/api/auth/me", async (ClaimsPrincipal principal, HttpContext http, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (!int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var userId))
+    {
+        return Results.Unauthorized();
+    }
+
+    try
+    {
+        await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+        await connection.OpenAsync();
+
+        var profile = await LoadProfileAsync(connection, userId);
+        if (profile is null)
+        {
+            // The account no longer exists, so the session is no longer valid.
+            await http.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            return Results.Unauthorized();
+        }
+        return Results.Ok(profile);
+    }
+    catch (SqlException ex)
+    {
+        logger.LogError(ex, "Loading the session user failed because of a database error");
+        return Results.Problem("Cannot connect to the database", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.RequireAuthorization()
+.WithName("GetCurrentUser");
+
+// Ends the session by removing the cookie. Safe to call without a session.
+app.MapPost("/api/auth/logout", async (HttpContext http) =>
+{
+    await http.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.NoContent();
+})
+.WithName("Logout");
+
 app.Run();
 
 static bool IsValidEmail(string email) =>
     System.Net.Mail.MailAddress.TryCreate(email, out var parsed) && parsed.Address == email;
+
+// Everything about a user except the password hash.
+static async Task<UserProfile?> LoadProfileAsync(SqlConnection connection, int userId)
+{
+    await using var command = new SqlCommand(
+        "SELECT user_id, name, surname, username, email, phone_number, address FROM USERS WHERE user_id = @userId",
+        connection);
+    command.Parameters.AddWithValue("@userId", userId);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+    {
+        return null;
+    }
+
+    return new UserProfile(
+        reader.GetInt32(0),
+        reader.GetString(1),
+        reader.GetString(2),
+        reader.GetString(3),
+        reader.GetString(4),
+        reader.IsDBNull(5) ? null : reader.GetString(5),
+        reader.IsDBNull(6) ? null : reader.GetString(6));
+}
+
+record UserProfile(
+    int UserId,
+    string Name,
+    string Surname,
+    string Username,
+    string Email,
+    string? PhoneNumber,
+    string? Address);
 
 record LoginRequest(string? Username, string? Password);
 
