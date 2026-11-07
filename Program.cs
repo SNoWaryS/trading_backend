@@ -259,7 +259,104 @@ app.MapPost("/api/auth/logout", async (HttpContext http) =>
 })
 .WithName("Logout");
 
+// Searches the card catalog (the cards that may be sold) by card name, set or number.
+// Returns at most `limit` cards (default 50, up to 100), sorted by name, so the add card form stays fast.
+const string CatalogColumns =
+    "catalog_id, card_name, set_name, card_number, card_type, rarity, card_stage, card_element, card_picture, reference_price";
+
+app.MapGet("/api/catalog", async (string? search, int? limit, IConfiguration config, ILogger<Program> logger) =>
+{
+    var term = search?.Trim() ?? "";
+    if (term.Length > 100)
+    {
+        return Results.BadRequest(new { message = "Search must be 100 characters or fewer" });
+    }
+    var take = Math.Clamp(limit ?? 50, 1, 100);
+
+    try
+    {
+        await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand(
+            $"""
+            SELECT TOP (@take) {CatalogColumns}
+            FROM CARD_CATALOG
+            WHERE @pattern IS NULL
+               OR card_name LIKE @pattern ESCAPE '\'
+               OR set_name LIKE @pattern ESCAPE '\'
+               OR card_number LIKE @pattern ESCAPE '\'
+            ORDER BY card_name, set_name, card_number
+            """,
+            connection);
+        command.Parameters.AddWithValue("@take", take);
+        command.Parameters.Add("@pattern", System.Data.SqlDbType.NVarChar, 210).Value =
+            term.Length == 0 ? DBNull.Value : $"%{EscapeLike(term)}%";
+
+        var cards = new List<CatalogCard>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            cards.Add(ReadCatalogCard(reader));
+        }
+        return Results.Ok(cards);
+    }
+    catch (SqlException ex)
+    {
+        logger.LogError(ex, "Searching the catalog failed because of a database error");
+        return Results.Problem("Cannot connect to the database", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.RequireAuthorization()
+.WithName("SearchCatalog");
+
+app.MapGet("/api/catalog/{catalogId:int}", async (int catalogId, IConfiguration config, ILogger<Program> logger) =>
+{
+    try
+    {
+        await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand(
+            $"SELECT {CatalogColumns} FROM CARD_CATALOG WHERE catalog_id = @catalogId",
+            connection);
+        command.Parameters.AddWithValue("@catalogId", catalogId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        return await reader.ReadAsync()
+            ? Results.Ok(ReadCatalogCard(reader))
+            : Results.NotFound(new { message = "This card is not in the catalog" });
+    }
+    catch (SqlException ex)
+    {
+        logger.LogError(ex, "Loading a catalog card failed because of a database error");
+        return Results.Problem("Cannot connect to the database", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.RequireAuthorization()
+.WithName("GetCatalogCard");
+
 app.Run();
+
+// LIKE treats %, _ and [ as wildcards; escape them so they match themselves.
+static string EscapeLike(string value) =>
+    value.Replace(@"\", @"\\").Replace("%", @"\%").Replace("_", @"\_").Replace("[", @"\[");
+
+static CatalogCard ReadCatalogCard(SqlDataReader reader)
+{
+    string? Text(int i) => reader.IsDBNull(i) ? null : reader.GetString(i);
+    return new CatalogCard(
+        reader.GetInt32(0),
+        reader.GetString(1),
+        Text(2),
+        Text(3),
+        reader.GetString(4),
+        reader.GetString(5),
+        Text(6),
+        Text(7),
+        Text(8),
+        reader.IsDBNull(9) ? null : reader.GetDecimal(9));
+}
 
 static bool IsValidEmail(string email) =>
     System.Net.Mail.MailAddress.TryCreate(email, out var parsed) && parsed.Address == email;
@@ -296,6 +393,18 @@ record UserProfile(
     string Email,
     string? PhoneNumber,
     string? Address);
+
+record CatalogCard(
+    int CatalogId,
+    string CardName,
+    string? SetName,
+    string? CardNumber,
+    string CardType,
+    string Rarity,
+    string? CardStage,
+    string? CardElement,
+    string? CardPicture,
+    decimal? ReferencePrice);
 
 record LoginRequest(string? Username, string? Password);
 
