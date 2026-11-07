@@ -47,6 +47,8 @@ app.UseCors();
 
 // Card photos sellers upload, served at /uploads/... (the folder is not committed to git).
 const string UploadsFolder = "uploads";
+// Files only some users may see, such as payment slips. Never served as static files (also not committed to git).
+const string PrivateFolder = "private";
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, UploadsFolder);
 Directory.CreateDirectory(uploadsPath);
 app.UseStaticFiles(new StaticFileOptions
@@ -355,7 +357,8 @@ const long MaxPictureBytes = 5 * 1024 * 1024;
 const string ListingSelect =
     """
     SELECT c.card_id, c.catalog_id, k.card_name, u.username, k.card_type, k.rarity, k.reference_price,
-           c.card_price, k.card_stage, c.card_picture, k.card_picture, k.card_element, c.card_description
+           c.card_price, k.card_stage, c.card_picture, k.card_picture, k.card_element, c.card_description,
+           CAST(CASE WHEN EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = c.card_id) THEN 1 ELSE 0 END AS BIT) AS sold
     FROM CARDS c
     JOIN CARD_CATALOG k ON k.catalog_id = c.catalog_id
     JOIN USERS u ON u.user_id = c.seller_id
@@ -519,6 +522,9 @@ app.MapPut("/api/listings/{cardId:int}", async (int cardId, UpdateListingRequest
             """
             UPDATE CARDS SET card_price = @price, card_description = @description
             WHERE card_id = @cardId AND seller_id = @sellerId
+              AND NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = CARDS.card_id);
+            SELECT @@ROWCOUNT, CAST(CASE WHEN EXISTS (SELECT 1 FROM ORDERS o JOIN CARDS c ON c.card_id = o.card_id
+                WHERE o.card_id = @cardId AND c.seller_id = @sellerId) THEN 1 ELSE 0 END AS BIT);
             """,
             connection);
         command.Parameters.AddWithValue("@cardId", cardId);
@@ -528,10 +534,19 @@ app.MapPut("/api/listings/{cardId:int}", async (int cardId, UpdateListingRequest
         command.Parameters["@price"].Scale = 2;
         command.Parameters.AddWithValue("@description", description.Length == 0 ? DBNull.Value : description);
 
-        // Someone else's listing looks the same as a missing one.
-        return await command.ExecuteNonQueryAsync() == 0
-            ? Results.NotFound(new { message = "You have no such card for sale" })
-            : Results.Ok(await LoadListingAsync(connection, cardId, request));
+        int changed;
+        bool sold;
+        await using (var reader = await command.ExecuteReaderAsync())
+        {
+            await reader.ReadAsync();
+            changed = reader.GetInt32(0);
+            sold = reader.GetBoolean(1);
+        }
+
+        // Someone else's listing looks the same as a missing one. A sold card keeps the price the buyer paid.
+        return changed > 0 ? Results.Ok(await LoadListingAsync(connection, cardId, request))
+            : sold ? Results.Conflict(new { message = "This card has been sold, so it cannot be changed" })
+            : Results.NotFound(new { message = "You have no such card for sale" });
     }
     catch (SqlException ex)
     {
@@ -582,7 +597,453 @@ app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal p
 .RequireAuthorization()
 .WithName("DeleteListing");
 
+// ---- Orders: a buyer ordering one listing, paid by bank transfer with a payment slip ----
+// pending -> shipped (the seller checked the slip and sent the card) -> received (the buyer confirmed it arrived).
+
+const int MaxReviewLength = 500;
+// Column order is what ReadReview expects; card_id (5) is for finding the card a review is about.
+const string ReviewSelect =
+    """
+    SELECT r.review_id, r.order_id, rb.username, r.review_status, r.comment, o.card_id
+    FROM REVIEWS r
+    JOIN USERS rb ON rb.user_id = r.buyer_id
+    JOIN ORDERS o ON o.order_id = r.order_id
+    """;
+// Column order is what ReadOrder and ReadSale expect.
+const string OrderSelect =
+    """
+    SELECT o.order_id, o.card_id, b.username, o.order_status, o.order_price, o.payment_slip,
+           b.name, b.surname, b.email, b.phone_number, b.address
+    FROM ORDERS o
+    JOIN USERS b ON b.user_id = o.user_id
+    JOIN CARDS c ON c.card_id = o.card_id
+    """;
+
+// The logged-in user's orders, newest first.
+app.MapGet("/api/orders/mine", async (ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+    return await QueryAsync(config, logger, "Loading orders", async connection =>
+    {
+        await using var command = new SqlCommand($"{OrderSelect} WHERE o.user_id = @userId ORDER BY o.order_id DESC", connection);
+        command.Parameters.AddWithValue("@userId", userId);
+        var orders = new List<Order>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            orders.Add(ReadOrder(reader, request));
+        }
+        return Results.Ok(orders);
+    });
+})
+.RequireAuthorization()
+.WithName("GetMyOrders");
+
+// Orders for the logged-in user's cards, newest first, with the buyer's contact details and address for shipping.
+app.MapGet("/api/orders/sales", async (ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+    return await QueryAsync(config, logger, "Loading sales", async connection =>
+    {
+        await using var command = new SqlCommand($"{OrderSelect} WHERE c.seller_id = @userId ORDER BY o.order_id DESC", connection);
+        command.Parameters.AddWithValue("@userId", userId);
+        var sales = new List<Sale>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            sales.Add(ReadSale(reader, request));
+        }
+        return Results.Ok(sales);
+    });
+})
+.RequireAuthorization()
+.WithName("GetMySales");
+
+// Orders a card. multipart/form-data: cardId and slip (the payment slip picture, required).
+// The price is the listing's price now, not one the browser sends.
+app.MapPost("/api/orders", async (HttpRequest request, ClaimsPrincipal principal, IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int buyerId)
+    {
+        return Results.Unauthorized();
+    }
+    if (!request.HasFormContentType)
+    {
+        return Results.BadRequest(new { message = "Send the order as a form" });
+    }
+
+    var form = await request.ReadFormAsync();
+    var slip = form.Files.GetFile("slip");
+    if (!int.TryParse(form["cardId"], out var cardId))
+    {
+        return Results.BadRequest(new { message = "Please choose a card to buy" });
+    }
+    if (slip is null)
+    {
+        return Results.BadRequest(new { message = "Please attach your payment slip" });
+    }
+    if (await PictureErrorAsync(slip) is { } slipError)
+    {
+        return Results.BadRequest(new { message = slipError });
+    }
+
+    string? slipName = null;
+    try
+    {
+        await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+        await connection.OpenAsync();
+
+        int sellerId;
+        decimal price;
+        await using (var card = new SqlCommand("SELECT seller_id, card_price FROM CARDS WHERE card_id = @cardId", connection))
+        {
+            card.Parameters.AddWithValue("@cardId", cardId);
+            await using var reader = await card.ExecuteReaderAsync();
+            if (!await reader.ReadAsync())
+            {
+                return Results.NotFound(new { message = "This card is not for sale" });
+            }
+            sellerId = reader.GetInt32(0);
+            price = reader.GetDecimal(1);
+        }
+        if (sellerId == buyerId)
+        {
+            return Results.BadRequest(new { message = "You cannot buy your own card" });
+        }
+
+        slipName = await SaveFileAsync(slip, SlipFolder(env));
+        await using var command = new SqlCommand(
+            """
+            INSERT INTO ORDERS (user_id, card_id, order_status, order_price, payment_slip)
+            OUTPUT INSERTED.order_id
+            VALUES (@buyerId, @cardId, N'pending', @price, @slip)
+            """,
+            connection);
+        command.Parameters.AddWithValue("@buyerId", buyerId);
+        command.Parameters.AddWithValue("@cardId", cardId);
+        command.Parameters.Add("@price", System.Data.SqlDbType.Decimal).Value = price;
+        command.Parameters["@price"].Precision = 12;
+        command.Parameters["@price"].Scale = 2;
+        command.Parameters.AddWithValue("@slip", $"slips/{slipName}");
+
+        var orderId = (int)(await command.ExecuteScalarAsync())!;
+        return Results.Created($"/api/orders/{orderId}", await LoadOrderAsync(connection, orderId, request));
+    }
+    catch (SqlException ex) when (ex.Number is 2601 or 2627) // UQ_ORDERS_card: someone ordered it first
+    {
+        DeleteSlip(slipName, env);
+        return Results.Conflict(new { message = "Sorry, someone has already bought this card" });
+    }
+    catch (SqlException ex)
+    {
+        DeleteSlip(slipName, env);
+        logger.LogError(ex, "Placing an order failed because of a database error");
+        return Results.Problem("Cannot connect to the database", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.RequireAuthorization()
+.WithName("PlaceOrder");
+
+// The payment slip picture, for the order's buyer and the card's seller only.
+app.MapGet("/api/orders/{orderId:int}/slip", async (int orderId, ClaimsPrincipal principal, IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+    return await QueryAsync(config, logger, "Loading a payment slip", async connection =>
+    {
+        await using var command = new SqlCommand(
+            """
+            SELECT o.payment_slip FROM ORDERS o JOIN CARDS c ON c.card_id = o.card_id
+            WHERE o.order_id = @orderId AND (o.user_id = @userId OR c.seller_id = @userId)
+            """,
+            connection);
+        command.Parameters.AddWithValue("@orderId", orderId);
+        command.Parameters.AddWithValue("@userId", userId);
+        var path = await command.ExecuteScalarAsync() as string;
+        var file = path is null ? null : Path.Combine(SlipFolder(env), Path.GetFileName(path));
+        if (file is null || !File.Exists(file))
+        {
+            return Results.NotFound(new { message = "No payment slip for this order" });
+        }
+        var contentType = Path.GetExtension(file) switch { ".png" => "image/png", ".webp" => "image/webp", _ => "image/jpeg" };
+        return Results.File(file, contentType);
+    });
+})
+.RequireAuthorization()
+.WithName("GetPaymentSlip");
+
+// The seller checked the payment and sent the card.
+app.MapPost("/api/orders/{orderId:int}/ship", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+    ChangeOrderStatusAsync(orderId, principal, request, config, logger, asSeller: true, from: "pending", to: "shipped"))
+.RequireAuthorization()
+.WithName("ShipOrder");
+
+// The buyer confirmed the card arrived, which unlocks the review.
+app.MapPost("/api/orders/{orderId:int}/receive", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+    ChangeOrderStatusAsync(orderId, principal, request, config, logger, asSeller: false, from: "shipped", to: "received"))
+.RequireAuthorization()
+.WithName("ReceiveOrder");
+
+// ---- Reviews: one per order, written by the buyer once they have received the card ----
+
+// Reviews on the logged-in user's own orders.
+app.MapGet("/api/reviews/mine", async (ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+    return await QueryAsync(config, logger, "Loading reviews", async connection =>
+    {
+        await using var command = new SqlCommand(
+            $"{ReviewSelect} WHERE r.buyer_id = @userId ORDER BY r.review_id DESC",
+            connection);
+        command.Parameters.AddWithValue("@userId", userId);
+        var reviews = new List<Review>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            reviews.Add(ReadReview(reader));
+        }
+        return Results.Ok(reviews);
+    });
+})
+.RequireAuthorization()
+.WithName("GetMyReviews");
+
+// Reviews buyers wrote on orders for this seller's cards, newest first, each with the card it was for.
+app.MapGet("/api/reviews", async (string? seller, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (string.IsNullOrWhiteSpace(seller))
+    {
+        return Results.BadRequest(new { message = "Say whose reviews to show" });
+    }
+    return await QueryAsync(config, logger, "Loading a seller's reviews", async connection =>
+    {
+        var found = new List<(Review Review, int CardId)>();
+        await using (var command = new SqlCommand(
+            $"""
+            {ReviewSelect}
+            JOIN CARDS c ON c.card_id = o.card_id
+            JOIN USERS s ON s.user_id = c.seller_id
+            WHERE s.username = @seller AND r.review_status = N'reviewed'
+            ORDER BY r.review_id DESC
+            """,
+            connection))
+        {
+            command.Parameters.AddWithValue("@seller", seller.Trim());
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                found.Add((ReadReview(reader), reader.GetInt32(5)));
+            }
+        }
+
+        var reviews = new List<SellerReview>();
+        foreach (var (review, cardId) in found)
+        {
+            if (await LoadListingAsync(connection, cardId, request) is { } card)
+            {
+                reviews.Add(new SellerReview(review, card));
+            }
+        }
+        return Results.Ok(reviews);
+    });
+})
+.RequireAuthorization()
+.WithName("GetSellerReviews");
+
+// The buyer reviews a received order, once. JSON: { comment }.
+app.MapPost("/api/orders/{orderId:int}/review", async (int orderId, AddReviewRequest body, ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+    var comment = body.Comment?.Trim() ?? "";
+    if (comment.Length == 0)
+    {
+        return Results.BadRequest(new { message = "Please write your review" });
+    }
+    if (comment.Length > MaxReviewLength)
+    {
+        return Results.BadRequest(new { message = $"Your review must be {MaxReviewLength} characters or fewer" });
+    }
+
+    try
+    {
+        await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+        await connection.OpenAsync();
+
+        string? status;
+        await using (var order = new SqlCommand("SELECT order_status FROM ORDERS WHERE order_id = @orderId AND user_id = @userId", connection))
+        {
+            order.Parameters.AddWithValue("@orderId", orderId);
+            order.Parameters.AddWithValue("@userId", userId);
+            status = await order.ExecuteScalarAsync() as string;
+        }
+        if (status is null)
+        {
+            return Results.NotFound(new { message = "You have no such order" });
+        }
+        if (status != "received")
+        {
+            return Results.Conflict(new { message = "Confirm receipt before reviewing this order" });
+        }
+
+        // A 'not_reviewed' row may already exist for the order; it becomes the review. A 'reviewed' one cannot change.
+        await using var command = new SqlCommand(
+            $"""
+            UPDATE REVIEWS SET comment = @comment, review_status = N'reviewed'
+            WHERE order_id = @orderId AND review_status = N'not_reviewed';
+            IF @@ROWCOUNT = 0
+                INSERT INTO REVIEWS (order_id, buyer_id, comment, review_status)
+                VALUES (@orderId, @userId, @comment, N'reviewed');
+            {ReviewSelect} WHERE r.order_id = @orderId;
+            """,
+            connection);
+        command.Parameters.AddWithValue("@orderId", orderId);
+        command.Parameters.AddWithValue("@userId", userId);
+        command.Parameters.AddWithValue("@comment", comment);
+        await using var reader = await command.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return Results.Created($"/api/orders/{orderId}/review", ReadReview(reader));
+    }
+    catch (SqlException ex) when (ex.Number is 2601 or 2627) // UQ_REVIEWS_order
+    {
+        return Results.Conflict(new { message = "This order has already been reviewed" });
+    }
+    catch (SqlException ex)
+    {
+        logger.LogError(ex, "Adding a review failed because of a database error");
+        return Results.Problem("Cannot connect to the database", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.RequireAuthorization()
+.WithName("AddReview");
+
 app.Run();
+
+static int? CurrentUserId(ClaimsPrincipal principal) =>
+    int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : null;
+
+// Opens a connection and runs a read; a database error becomes a 503 like everywhere else.
+static async Task<IResult> QueryAsync(IConfiguration config, ILogger logger, string what, Func<SqlConnection, Task<IResult>> run)
+{
+    try
+    {
+        await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+        await connection.OpenAsync();
+        return await run(connection);
+    }
+    catch (SqlException ex)
+    {
+        logger.LogError(ex, "{What} failed because of a database error", what);
+        return Results.Problem("Cannot connect to the database", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+}
+
+// Moves an order one step on. Only the card's seller ships, and only the buyer confirms receipt.
+static Task<IResult> ChangeOrderStatusAsync(int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config,
+    ILogger logger, bool asSeller, string from, string to)
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Task.FromResult(Results.Unauthorized());
+    }
+    return QueryAsync(config, logger, $"Marking an order as {to}", async connection =>
+    {
+        await using (var command = new SqlCommand(
+            $"""
+            SELECT o.order_status FROM ORDERS o JOIN CARDS c ON c.card_id = o.card_id
+            WHERE o.order_id = @orderId AND {(asSeller ? "c.seller_id" : "o.user_id")} = @userId
+            """,
+            connection))
+        {
+            command.Parameters.AddWithValue("@orderId", orderId);
+            command.Parameters.AddWithValue("@userId", userId);
+            var status = await command.ExecuteScalarAsync() as string;
+            if (status is null)
+            {
+                return Results.NotFound(new { message = "You have no such order" });
+            }
+            if (status != from)
+            {
+                return Results.Conflict(new { message = to == "shipped"
+                    ? "This order has already been shipped"
+                    : "This order cannot be marked as received yet" });
+            }
+        }
+
+        await using (var update = new SqlCommand(
+            "UPDATE ORDERS SET order_status = @to WHERE order_id = @orderId AND order_status = @from",
+            connection))
+        {
+            update.Parameters.AddWithValue("@orderId", orderId);
+            update.Parameters.AddWithValue("@from", from);
+            update.Parameters.AddWithValue("@to", to);
+            if (await update.ExecuteNonQueryAsync() == 0)
+            {
+                return Results.Conflict(new { message = "This order changed meanwhile. Please reload the page." });
+            }
+        }
+        return Results.Ok(await LoadOrderAsync(connection, orderId, request));
+    });
+}
+
+static async Task<Order?> LoadOrderAsync(SqlConnection connection, int orderId, HttpRequest request)
+{
+    await using var command = new SqlCommand($"{OrderSelect} WHERE o.order_id = @orderId", connection);
+    command.Parameters.AddWithValue("@orderId", orderId);
+    await using var reader = await command.ExecuteReaderAsync();
+    return await reader.ReadAsync() ? ReadOrder(reader, request) : null;
+}
+
+static Order ReadOrder(SqlDataReader reader, HttpRequest request)
+{
+    var orderId = reader.GetInt32(0);
+    return new Order(
+        orderId,
+        reader.GetInt32(1),
+        reader.GetString(2),
+        reader.GetString(3),
+        reader.GetDecimal(4),
+        // The slip is only sent through the slip endpoint, which checks who is asking.
+        reader.IsDBNull(5) ? null : $"{request.Scheme}://{request.Host}/api/orders/{orderId}/slip");
+}
+
+static Sale ReadSale(SqlDataReader reader, HttpRequest request)
+{
+    string? Text(int i) => reader.IsDBNull(i) ? null : reader.GetString(i);
+    var order = ReadOrder(reader, request);
+    return new Sale(
+        order.OrderId, order.CardId, order.BuyerName, order.OrderStatus, order.OrderPrice, order.PaymentSlip,
+        new BuyerContact(reader.GetString(6), reader.GetString(7), reader.GetString(8), Text(9), Text(10)));
+}
+
+static Review ReadReview(SqlDataReader reader) =>
+    new(reader.GetInt32(0), reader.GetInt32(1), reader.GetString(2), reader.GetString(3), reader.IsDBNull(4) ? "" : reader.GetString(4));
+
+static void DeleteSlip(string? name, IWebHostEnvironment env)
+{
+    if (name is null)
+    {
+        return;
+    }
+    var file = Path.Combine(SlipFolder(env), Path.GetFileName(name));
+    if (File.Exists(file))
+    {
+        File.Delete(file);
+    }
+}
 
 // A listing joined with its catalog card and seller. card_picture is the seller's photo, or the catalog picture without one.
 static async Task<CardListing?> LoadListingAsync(SqlConnection connection, int cardId, HttpRequest request)
@@ -611,7 +1072,8 @@ static CardListing ReadListing(SqlDataReader reader, HttpRequest request)
         Text(8),
         Text(11),
         picture,
-        Text(12));
+        Text(12),
+        reader.GetBoolean(13));
 }
 
 // The price must be a whole number of baht from 1 to the largest that fits DECIMAL(12,2).
@@ -648,18 +1110,24 @@ static async Task<string?> PictureExtensionAsync(IFormFile file)
 }
 
 // Saves an uploaded picture under uploads/listings with a random name and returns its path on this API.
-static async Task<string> SavePictureAsync(IFormFile file, IWebHostEnvironment env)
+static async Task<string> SavePictureAsync(IFormFile file, IWebHostEnvironment env) =>
+    $"/{UploadsFolder}/listings/{await SaveFileAsync(file, Path.Combine(env.ContentRootPath, UploadsFolder, "listings"))}";
+
+// Saves a picture in the folder with a random name and returns the name.
+static async Task<string> SaveFileAsync(IFormFile file, string folder)
 {
     var extension = await PictureExtensionAsync(file) ?? throw new InvalidOperationException("Not a picture");
-    var folder = Path.Combine(env.ContentRootPath, UploadsFolder, "listings");
     Directory.CreateDirectory(folder);
     var name = $"{Guid.NewGuid():N}{extension}";
     await using (var output = File.Create(Path.Combine(folder, name)))
     {
         await file.CopyToAsync(output);
     }
-    return $"/{UploadsFolder}/listings/{name}";
+    return name;
 }
+
+// Payment slips are private: they live outside the public uploads folder and are only sent to the buyer and seller.
+static string SlipFolder(IWebHostEnvironment env) => Path.Combine(env.ContentRootPath, PrivateFolder, "slips");
 
 static void DeletePicture(string? path, IWebHostEnvironment env)
 {
@@ -755,9 +1223,24 @@ record CardListing(
     string? CardStage,
     string? CardElement,
     string? CardPicture,
-    string? CardDescription);
+    string? CardDescription,
+    bool Sold); // someone has ordered it
 
 record UpdateListingRequest(decimal? CardPrice, string? CardDescription);
+
+// One order. PaymentSlip is the address of the slip picture, which only the buyer and seller can open.
+record Order(int OrderId, int CardId, string BuyerName, string OrderStatus, decimal OrderPrice, string? PaymentSlip);
+
+// An order for one of the seller's cards, with what the seller needs to send it.
+record Sale(int OrderId, int CardId, string BuyerName, string OrderStatus, decimal OrderPrice, string? PaymentSlip, BuyerContact Buyer);
+
+record BuyerContact(string Name, string Surname, string Email, string? PhoneNumber, string? Address);
+
+record Review(int ReviewId, int OrderId, string BuyerName, string ReviewStatus, string Comment);
+
+record SellerReview(Review Review, CardListing Card);
+
+record AddReviewRequest(string? Comment);
 
 record LoginRequest(string? Username, string? Password);
 
