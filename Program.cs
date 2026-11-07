@@ -2,6 +2,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -37,6 +38,33 @@ builder.Services
         {
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return Task.CompletedTask;
+        };
+        // A deleted account's sessions stop working at once, on every device, not only in the browser that deleted it.
+        options.Events.OnValidatePrincipal = async context =>
+        {
+            if (!int.TryParse(context.Principal?.FindFirstValue(ClaimTypes.NameIdentifier), out var userId))
+            {
+                context.RejectPrincipal();
+                return;
+            }
+            try
+            {
+                var config = context.HttpContext.RequestServices.GetRequiredService<IConfiguration>();
+                await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+                await connection.OpenAsync();
+                await using var command = new SqlCommand(
+                    "SELECT 1 FROM USERS WHERE user_id = @userId AND deleted_at IS NULL", connection);
+                command.Parameters.AddWithValue("@userId", userId);
+                if (await command.ExecuteScalarAsync() is null)
+                {
+                    context.RejectPrincipal();
+                    await context.HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+                }
+            }
+            catch (SqlException)
+            {
+                // Keep the session; the endpoint itself reports that the database cannot be reached.
+            }
         };
     });
 builder.Services.AddAuthorization();
@@ -181,15 +209,10 @@ app.MapPost("/api/auth/register", async (RegisterRequest request, IConfiguration
     var address = request.Address?.Trim() ?? "";
 
     var validationError =
-        name.Length == 0 || surname.Length == 0 || username.Length == 0 || email.Length == 0 || password.Length == 0
-            ? "Please fill in all required fields"
-        : name.Length > 100 || surname.Length > 100 ? "Name and surname must be 100 characters or fewer"
+        username.Length == 0 || password.Length == 0 ? "Please fill in all required fields"
         : username.Length > 50 ? "Username must be 50 characters or fewer"
-        : email.Length > 255 || !IsValidEmail(email) ? "Please enter a valid email"
         : password.Length is < 8 or > 128 ? "Password must be 8 to 128 characters"
-        : phoneNumber.Length > 20 ? "Phone number must be 20 characters or fewer"
-        : address.Length > 500 ? "Address must be 500 characters or fewer"
-        : null;
+        : ProfileError(name, surname, email, phoneNumber, address);
     if (validationError is not null)
     {
         return Results.BadRequest(new { message = validationError });
@@ -271,6 +294,202 @@ app.MapPost("/api/auth/logout", async (HttpContext http) =>
     return Results.NoContent();
 })
 .WithName("Logout");
+
+// A seller's public details, for their profile page. 404 when nobody has this username or the account was deleted.
+app.MapGet("/api/users/{username}", (string username, IConfiguration config, ILogger<Program> logger) =>
+    QueryAsync(config, logger, "Loading a public profile", async connection =>
+    {
+        await using var command = new SqlCommand(
+            """
+            SELECT user_id, name, surname, username, email, phone_number
+            FROM USERS WHERE username = @username AND deleted_at IS NULL
+            """,
+            connection);
+        command.Parameters.AddWithValue("@username", username);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return Results.NotFound(new { message = "This seller does not exist" });
+        }
+        return Results.Ok(new PublicProfile(
+            reader.GetInt32(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetString(3),
+            reader.GetString(4),
+            reader.IsDBNull(5) ? null : reader.GetString(5)));
+    }))
+.RequireAuthorization()
+.WithName("GetPublicProfile");
+
+// Changes the logged-in user's own details. The username stays fixed because orders and reviews show it.
+app.MapPut("/api/users/me", async (UpdateProfileRequest request, ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+
+    var name = request.Name?.Trim() ?? "";
+    var surname = request.Surname?.Trim() ?? "";
+    var email = request.Email?.Trim() ?? "";
+    var phoneNumber = request.PhoneNumber?.Trim() ?? "";
+    var address = request.Address?.Trim() ?? "";
+    if (ProfileError(name, surname, email, phoneNumber, address) is string error)
+    {
+        return Results.BadRequest(new { message = error });
+    }
+
+    return await QueryAsync(config, logger, "Updating a profile", async connection =>
+    {
+        await using var command = new SqlCommand(
+            """
+            UPDATE USERS
+            SET name = @name, surname = @surname, email = @email, phone_number = @phoneNumber, address = @address
+            WHERE user_id = @userId AND deleted_at IS NULL
+            """,
+            connection);
+        command.Parameters.AddWithValue("@userId", userId);
+        command.Parameters.AddWithValue("@name", name);
+        command.Parameters.AddWithValue("@surname", surname);
+        command.Parameters.AddWithValue("@email", email);
+        command.Parameters.AddWithValue("@phoneNumber", phoneNumber.Length == 0 ? DBNull.Value : phoneNumber);
+        command.Parameters.AddWithValue("@address", address.Length == 0 ? DBNull.Value : address);
+
+        try
+        {
+            if (await command.ExecuteNonQueryAsync() == 0)
+            {
+                return Results.Unauthorized();
+            }
+        }
+        catch (SqlException ex) when (ex.Number is 2601 or 2627) // UQ_USERS_email
+        {
+            return Results.Conflict(new { message = "This email is already used by another account" });
+        }
+        return Results.Ok(await LoadProfileAsync(connection, userId));
+    });
+})
+.RequireAuthorization()
+.WithName("UpdateProfile");
+
+// Deletes the logged-in user's account after they confirm with their password. Sign-in stops working at once,
+// cards nobody has ordered are taken off sale, and the rest is removed 30 days later (PurgeDeletedAccountsAsync).
+// Not allowed while one of their orders, as buyer or seller, is still pending or shipped: the other person still
+// needs to reach them.
+app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, HttpContext http, ClaimsPrincipal principal,
+    IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
+{
+    if (CurrentUserId(principal) is not int userId)
+    {
+        return Results.Unauthorized();
+    }
+    if (string.IsNullOrEmpty(request.Password))
+    {
+        return Results.BadRequest(new { message = "Please enter your password" });
+    }
+
+    return await QueryAsync(config, logger, "Deleting an account", async connection =>
+    {
+        await using (var check = new SqlCommand(
+            "SELECT password FROM USERS WHERE user_id = @userId AND deleted_at IS NULL", connection))
+        {
+            check.Parameters.AddWithValue("@userId", userId);
+            if (await check.ExecuteScalarAsync() is not string hash)
+            {
+                return Results.Unauthorized();
+            }
+            if (passwordHasher.VerifyHashedPassword(string.Empty, hash, request.Password) == PasswordVerificationResult.Failed)
+            {
+                return Results.BadRequest(new { message = "Incorrect password" });
+            }
+        }
+
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync();
+
+        // Takes the cards nobody has ordered off sale first. Someone buying one of them now waits for this
+        // transaction and then fails, and an order placed just before is caught by the check below.
+        var pictures = new List<string?>();
+        await using (var remove = new SqlCommand(
+            """
+            DELETE FROM CARDS OUTPUT DELETED.card_picture
+            WHERE seller_id = @userId AND NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = CARDS.card_id);
+            """,
+            connection,
+            transaction))
+        {
+            remove.Parameters.AddWithValue("@userId", userId);
+            await using var reader = await remove.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                pictures.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
+            }
+        }
+
+        await using (var open = new SqlCommand(
+            """
+            SELECT COUNT(*)
+            FROM ORDERS o JOIN CARDS c ON c.card_id = o.card_id
+            WHERE (o.user_id = @userId OR c.seller_id = @userId) AND o.order_status IN (N'pending', N'shipped')
+            """,
+            connection,
+            transaction))
+        {
+            open.Parameters.AddWithValue("@userId", userId);
+            if ((int)(await open.ExecuteScalarAsync())! > 0)
+            {
+                await transaction.RollbackAsync(); // puts the cards back on sale
+                return Results.Conflict(new
+                {
+                    message = "You still have orders that are not finished. Wait until every order you bought or sold is received, then try again.",
+                });
+            }
+        }
+
+        await using (var mark = new SqlCommand(
+            "UPDATE USERS SET deleted_at = SYSUTCDATETIME() WHERE user_id = @userId", connection, transaction))
+        {
+            mark.Parameters.AddWithValue("@userId", userId);
+            await mark.ExecuteNonQueryAsync();
+        }
+        await transaction.CommitAsync();
+
+        foreach (var picture in pictures)
+        {
+            DeletePicture(picture, env);
+        }
+        await http.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+        return Results.NoContent();
+    });
+})
+.RequireAuthorization()
+.WithName("DeleteAccount");
+
+// Removes accounts deleted more than 30 days ago: once when the API starts, then every hour while it runs.
+app.Lifetime.ApplicationStarted.Register(() => _ = Task.Run(async () =>
+{
+    var stopping = app.Lifetime.ApplicationStopping;
+    using var timer = new PeriodicTimer(TimeSpan.FromHours(1));
+    try
+    {
+        do
+        {
+            try
+            {
+                await PurgeDeletedAccountsAsync(app.Configuration, app.Environment, app.Logger);
+            }
+            catch (SqlException ex)
+            {
+                app.Logger.LogError(ex, "Removing deleted accounts failed because of a database error");
+            }
+        } while (await timer.WaitForNextTickAsync(stopping));
+    }
+    catch (OperationCanceledException)
+    {
+        // The API is shutting down.
+    }
+}));
 
 // Searches the card catalog (the cards that may be sold) by card name, set or number.
 // Returns at most `limit` cards (default 50, up to 100), sorted by name, so the add card form stays fast.
@@ -1162,6 +1381,71 @@ static CatalogCard ReadCatalogCard(SqlDataReader reader)
         reader.IsDBNull(9) ? null : reader.GetDecimal(9));
 }
 
+// The details a user enters at registration and may change later. Same limits as the USERS table.
+static string? ProfileError(string name, string surname, string email, string phoneNumber, string address) =>
+    name.Length == 0 || surname.Length == 0 || email.Length == 0 ? "Please fill in all required fields"
+    : name.Length > 100 || surname.Length > 100 ? "Name and surname must be 100 characters or fewer"
+    : email.Length > 255 || !IsValidEmail(email) ? "Please enter a valid email"
+    : phoneNumber.Length > 20 ? "Phone number must be 20 characters or fewer"
+    : address.Length > 500 ? "Address must be 500 characters or fewer"
+    : null;
+
+// Removes accounts deleted more than 30 days ago, with their activity, as the privacy policy promises: their cards,
+// the orders they placed or received and the reviews on those orders, and the photos and slips those point to.
+// Cards a deleted user bought go too, because a card whose order is gone would be back on sale.
+static async Task PurgeDeletedAccountsAsync(IConfiguration config, IWebHostEnvironment env, ILogger logger)
+{
+    await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
+    await connection.OpenAsync();
+    await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync();
+
+    await using var command = new SqlCommand(
+        """
+        SET NOCOUNT ON;
+        DECLARE @users TABLE (user_id INT PRIMARY KEY);
+        INSERT INTO @users SELECT user_id FROM USERS WHERE deleted_at < DATEADD(day, -30, SYSUTCDATETIME());
+
+        DECLARE @cards TABLE (card_id INT PRIMARY KEY);
+        INSERT INTO @cards
+            SELECT card_id FROM CARDS WHERE seller_id IN (SELECT user_id FROM @users)
+            UNION
+            SELECT card_id FROM ORDERS WHERE user_id IN (SELECT user_id FROM @users);
+
+        DELETE FROM REVIEWS
+        WHERE buyer_id IN (SELECT user_id FROM @users)
+           OR order_id IN (SELECT order_id FROM ORDERS WHERE card_id IN (SELECT card_id FROM @cards));
+        DELETE FROM ORDERS OUTPUT N'slip', DELETED.payment_slip WHERE card_id IN (SELECT card_id FROM @cards);
+        DELETE FROM CARDS OUTPUT N'picture', DELETED.card_picture WHERE card_id IN (SELECT card_id FROM @cards);
+        DELETE FROM USERS OUTPUT N'user', DELETED.username WHERE user_id IN (SELECT user_id FROM @users);
+        """,
+        connection,
+        transaction);
+
+    var removed = new List<(string Kind, string? Value)>();
+    await using (var reader = await command.ExecuteReaderAsync())
+    {
+        do
+        {
+            while (await reader.ReadAsync())
+            {
+                removed.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+            }
+        } while (await reader.NextResultAsync());
+    }
+    await transaction.CommitAsync();
+
+    foreach (var (kind, value) in removed)
+    {
+        if (kind == "slip") DeleteSlip(value, env);
+        if (kind == "picture") DeletePicture(value, env);
+    }
+    var users = removed.Where((item) => item.Kind == "user").Select((item) => item.Value).ToList();
+    if (users.Count > 0)
+    {
+        logger.LogInformation("Removed {Count} deleted accounts: {Usernames}", users.Count, string.Join(", ", users));
+    }
+}
+
 static bool IsValidEmail(string email) =>
     System.Net.Mail.MailAddress.TryCreate(email, out var parsed) && parsed.Address == email;
 
@@ -1169,7 +1453,7 @@ static bool IsValidEmail(string email) =>
 static async Task<UserProfile?> LoadProfileAsync(SqlConnection connection, int userId)
 {
     await using var command = new SqlCommand(
-        "SELECT user_id, name, surname, username, email, phone_number, address FROM USERS WHERE user_id = @userId",
+        "SELECT user_id, name, surname, username, email, phone_number, address FROM USERS WHERE user_id = @userId AND deleted_at IS NULL",
         connection);
     command.Parameters.AddWithValue("@userId", userId);
 
@@ -1243,6 +1527,13 @@ record SellerReview(Review Review, CardListing Card);
 record AddReviewRequest(string? Comment);
 
 record LoginRequest(string? Username, string? Password);
+
+// What other users may see about a seller, so buyers can contact them. The address stays private.
+record PublicProfile(int UserId, string Name, string Surname, string Username, string Email, string? PhoneNumber);
+
+record UpdateProfileRequest(string? Name, string? Surname, string? Email, string? PhoneNumber, string? Address);
+
+record DeleteAccountRequest(string? Password);
 
 record RegisterRequest(
     string? Name,
