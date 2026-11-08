@@ -648,6 +648,81 @@ app.MapGet("/api/listings/{cardId:int}", async (int cardId, HttpRequest request,
 .RequireAuthorization()
 .WithName("GetListing");
 
+// Cards for sale like what the user searched for, by vector similarity (see CardVectors.cs), for the Home page.
+// The search vector is the average of the vectors of the cards whose name contains `search` (and that have
+// `element`, when given). Cards for sale are tried first; when none match, the catalog is used, so a card nobody
+// is selling still gets suggestions. The result leaves out the matching cards themselves (Home already shows
+// them), sold cards and the logged-in user's own cards. `limit` defaults to 4, up to 12.
+app.MapGet("/api/listings/similar", (string? search, string? element, int? limit, ClaimsPrincipal principal,
+    HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+{
+    var term = search?.Trim() ?? "";
+    var empty = new SimilarSearch("none", 0, []);
+    if (term.Length == 0)
+    {
+        return Task.FromResult(Results.Ok(empty));
+    }
+    var viewer = principal.FindFirstValue(ClaimTypes.Name) ?? "";
+    bool Named(string name) => name.Contains(term, StringComparison.OrdinalIgnoreCase);
+    bool HasElement(string? cardElement) => string.IsNullOrEmpty(element) || cardElement == element;
+
+    return QueryAsync(config, logger, "Finding similar cards", async connection =>
+    {
+        var forSale = new List<CardListing>();
+        await using (var command = new SqlCommand(
+            $"""
+            {ListingSelect}
+            WHERE NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = c.card_id AND o.order_status <> N'cancelled')
+            """,
+            connection))
+        {
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                forSale.Add(ReadListing(reader, request));
+            }
+        }
+
+        // The same match as the Home page's search, so "matching" here means the cards Home shows.
+        var matching = forSale.Where((card) => Named(card.CardName) && HasElement(card.CardElement)).ToList();
+        var basedOn = "listings";
+        var vectors = matching.Select(CardVectors.ToVector).ToList();
+        if (vectors.Count == 0)
+        {
+            basedOn = "catalog";
+            await using var command = new SqlCommand(
+                $"SELECT TOP (50) {CatalogColumns} FROM CARD_CATALOG WHERE card_name LIKE @search ESCAPE '\\' ORDER BY card_name",
+                connection);
+            command.Parameters.AddWithValue("@search", $"%{EscapeLike(term)}%");
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var card = ReadCatalogCard(reader);
+                if (HasElement(card.CardElement) || card.CardElement is null)
+                {
+                    vectors.Add(CardVectors.ToVector(card));
+                }
+            }
+        }
+        if (vectors.Count == 0)
+        {
+            return Results.Ok(empty);
+        }
+
+        var target = CardVectors.Average(vectors);
+        var similar = forSale
+            .Where((card) => card.SellerName != viewer && !Named(card.CardName) && HasElement(card.CardElement))
+            .Select((card) => new SimilarCard(card, Math.Round(CardVectors.Cosine(target, CardVectors.ToVector(card)), 3)))
+            .OrderByDescending((item) => item.Similarity)
+            .ThenBy((item) => item.Card.CardPrice)
+            .Take(Math.Clamp(limit ?? 4, 1, 12))
+            .ToList();
+        return Results.Ok(new SimilarSearch(basedOn, vectors.Count, similar));
+    });
+})
+.RequireAuthorization()
+.WithName("GetSimilarListings");
+
 // Lists a catalog card for sale. multipart/form-data: catalogId, cardPrice, cardDescription (optional), photo (optional).
 // The form is read by hand, so no antiforgery token is involved; the SameSite=Strict session cookie already
 // keeps other sites from posting here.
@@ -1578,6 +1653,14 @@ record CardListing(
     string? CardPicture,
     string? CardDescription,
     bool Sold); // someone has ordered it
+
+// A card for sale and how alike it is to another card, from 0 (nothing alike) to 1 (alike in every way).
+record SimilarCard(CardListing Card, double Similarity);
+
+// Cards like a search. BasedOn says which cards the search vector came from: "listings" (cards for sale whose name
+// matched), "catalog" (none for sale, so catalog cards whose name matched) or "none" (nothing matched).
+// Matches is how many cards were averaged into the search vector.
+record SimilarSearch(string BasedOn, int Matches, List<SimilarCard> Cards);
 
 record UpdateListingRequest(decimal? CardPrice, string? CardDescription);
 
