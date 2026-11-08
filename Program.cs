@@ -1444,13 +1444,20 @@ static CatalogCard ReadCatalogCard(SqlDataReader reader)
 }
 
 // The details a user enters at registration and may change later. Same limits as the USERS table.
+// Phone number and address are required: buyers and sellers contact each other by phone, and sellers ship to the address.
 static string? ProfileError(string name, string surname, string email, string phoneNumber, string address) =>
-    name.Length == 0 || surname.Length == 0 || email.Length == 0 ? "Please fill in all required fields"
+    name.Length == 0 || surname.Length == 0 || email.Length == 0 || phoneNumber.Length == 0 || address.Length == 0
+        ? "Please fill in all required fields"
     : name.Length > 100 || surname.Length > 100 ? "Name and surname must be 100 characters or fewer"
     : email.Length > 255 || !IsValidEmail(email) ? "Please enter a valid email"
-    : phoneNumber.Length > 20 ? "Phone number must be 20 characters or fewer"
+    : phoneNumber.Length > 20 || !IsValidPhoneNumber(phoneNumber) ? "Please enter a valid phone number"
     : address.Length > 500 ? "Address must be 500 characters or fewer"
     : null;
+
+// Digits, with spaces, dashes or a leading + allowed between them, e.g. 081-234-5678 or +66 81 234 5678.
+static bool IsValidPhoneNumber(string phoneNumber) =>
+    System.Text.RegularExpressions.Regex.IsMatch(phoneNumber, @"^\+?[0-9][0-9 -]*[0-9]$")
+    && phoneNumber.Count(char.IsAsciiDigit) is >= 9 and <= 15;
 
 // Removes accounts deleted more than 30 days ago, with their activity, as the privacy policy promises: their cards,
 // the orders they placed or received and the reviews on those orders, and the photos and slips those point to.
