@@ -411,16 +411,28 @@ app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, H
         // Takes the cards nobody has ordered off sale first. Someone buying one of them now waits for this
         // transaction and then fails, and an order placed just before is caught by the check below.
         var pictures = new List<string?>();
+        var slips = new List<string?>();
         await using (var remove = new SqlCommand(
             """
-            DELETE FROM CARDS OUTPUT DELETED.card_picture
-            WHERE seller_id = @userId AND NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = CARDS.card_id);
+            DECLARE @cards TABLE (card_id INT PRIMARY KEY);
+            INSERT INTO @cards SELECT card_id FROM CARDS
+            WHERE seller_id = @userId
+              AND NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = CARDS.card_id AND o.order_status <> N'cancelled');
+
+            DELETE FROM REVIEWS WHERE order_id IN (SELECT order_id FROM ORDERS WHERE card_id IN (SELECT card_id FROM @cards));
+            DELETE FROM ORDERS OUTPUT DELETED.payment_slip WHERE card_id IN (SELECT card_id FROM @cards);
+            DELETE FROM CARDS OUTPUT DELETED.card_picture WHERE card_id IN (SELECT card_id FROM @cards);
             """,
             connection,
             transaction))
         {
             remove.Parameters.AddWithValue("@userId", userId);
             await using var reader = await remove.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                slips.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
+            }
+            await reader.NextResultAsync();
             while (await reader.ReadAsync())
             {
                 pictures.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
@@ -458,6 +470,10 @@ app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, H
         foreach (var picture in pictures)
         {
             DeletePicture(picture, env);
+        }
+        foreach (var slip in slips)
+        {
+            DeleteSlip(slip, env);
         }
         await http.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
         return Results.NoContent();
@@ -577,7 +593,7 @@ const string ListingSelect =
     """
     SELECT c.card_id, c.catalog_id, k.card_name, u.username, k.card_type, k.rarity, k.reference_price,
            c.card_price, k.card_stage, c.card_picture, k.card_picture, k.card_element, c.card_description,
-           CAST(CASE WHEN EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = c.card_id) THEN 1 ELSE 0 END AS BIT) AS sold
+           CAST(CASE WHEN EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = c.card_id AND o.order_status <> N'cancelled') THEN 1 ELSE 0 END AS BIT) AS sold
     FROM CARDS c
     JOIN CARD_CATALOG k ON k.catalog_id = c.catalog_id
     JOIN USERS u ON u.user_id = c.seller_id
@@ -741,9 +757,9 @@ app.MapPut("/api/listings/{cardId:int}", async (int cardId, UpdateListingRequest
             """
             UPDATE CARDS SET card_price = @price, card_description = @description
             WHERE card_id = @cardId AND seller_id = @sellerId
-              AND NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = CARDS.card_id);
+              AND NOT EXISTS (SELECT 1 FROM ORDERS o WHERE o.card_id = CARDS.card_id AND o.order_status <> N'cancelled');
             SELECT @@ROWCOUNT, CAST(CASE WHEN EXISTS (SELECT 1 FROM ORDERS o JOIN CARDS c ON c.card_id = o.card_id
-                WHERE o.card_id = @cardId AND c.seller_id = @sellerId) THEN 1 ELSE 0 END AS BIT);
+                WHERE o.card_id = @cardId AND c.seller_id = @sellerId AND o.order_status <> N'cancelled') THEN 1 ELSE 0 END AS BIT);
             """,
             connection);
         command.Parameters.AddWithValue("@cardId", cardId);
@@ -789,18 +805,48 @@ app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal p
         await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
         await connection.OpenAsync();
 
+        // Cancelled orders go with the card. An order that is still active makes the DELETE fail (547), and
+        // XACT_ABORT then rolls the whole batch back.
         await using var command = new SqlCommand(
-            "DELETE FROM CARDS OUTPUT DELETED.card_picture WHERE card_id = @cardId AND seller_id = @sellerId",
+            """
+            SET XACT_ABORT ON;
+            BEGIN TRANSACTION;
+            DECLARE @slips TABLE (payment_slip NVARCHAR(1000));
+            IF EXISTS (SELECT 1 FROM CARDS WHERE card_id = @cardId AND seller_id = @sellerId)
+            BEGIN
+                DELETE FROM REVIEWS WHERE order_id IN
+                    (SELECT order_id FROM ORDERS WHERE card_id = @cardId AND order_status = N'cancelled');
+                DELETE FROM ORDERS OUTPUT DELETED.payment_slip INTO @slips
+                WHERE card_id = @cardId AND order_status = N'cancelled';
+            END
+            DELETE FROM CARDS OUTPUT DELETED.card_picture WHERE card_id = @cardId AND seller_id = @sellerId;
+            SELECT payment_slip FROM @slips;
+            COMMIT;
+            """,
             connection);
         command.Parameters.AddWithValue("@cardId", cardId);
         command.Parameters.AddWithValue("@sellerId", sellerId);
 
-        await using var reader = await command.ExecuteReaderAsync();
-        if (!await reader.ReadAsync())
+        string? picture;
+        var slips = new List<string?>();
+        await using (var reader = await command.ExecuteReaderAsync())
         {
-            return Results.NotFound(new { message = "You have no such card for sale" });
+            if (!await reader.ReadAsync())
+            {
+                return Results.NotFound(new { message = "You have no such card for sale" });
+            }
+            picture = reader.IsDBNull(0) ? null : reader.GetString(0);
+            await reader.NextResultAsync();
+            while (await reader.ReadAsync())
+            {
+                slips.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
+            }
         }
-        DeletePicture(reader.IsDBNull(0) ? null : reader.GetString(0), env);
+        DeletePicture(picture, env);
+        foreach (var slip in slips)
+        {
+            DeleteSlip(slip, env);
+        }
         return Results.NoContent();
     }
     catch (SqlException ex) when (ex.Number == 547) // an order refers to this card
@@ -818,6 +864,7 @@ app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal p
 
 // ---- Orders: a buyer ordering one listing, paid by bank transfer with a payment slip ----
 // pending -> shipped (the seller checked the slip and sent the card) -> received (the buyer confirmed it arrived).
+// A pending order may be cancelled by either side instead; the card then goes back on sale.
 
 const int MaxReviewLength = 500;
 // Column order is what ReadReview expects; card_id (5) is for finding the card a review is about.
@@ -1001,15 +1048,22 @@ app.MapGet("/api/orders/{orderId:int}/slip", async (int orderId, ClaimsPrincipal
 
 // The seller checked the payment and sent the card.
 app.MapPost("/api/orders/{orderId:int}/ship", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
-    ChangeOrderStatusAsync(orderId, principal, request, config, logger, asSeller: true, from: "pending", to: "shipped"))
+    ChangeOrderStatusAsync(orderId, principal, request, config, logger, OrderParty.Seller, from: "pending", to: "shipped"))
 .RequireAuthorization()
 .WithName("ShipOrder");
 
 // The buyer confirmed the card arrived, which unlocks the review.
 app.MapPost("/api/orders/{orderId:int}/receive", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
-    ChangeOrderStatusAsync(orderId, principal, request, config, logger, asSeller: false, from: "shipped", to: "received"))
+    ChangeOrderStatusAsync(orderId, principal, request, config, logger, OrderParty.Buyer, from: "shipped", to: "received"))
 .RequireAuthorization()
 .WithName("ReceiveOrder");
+
+// The buyer or the seller calls off an order that has not been shipped, for example when the payment slip is wrong.
+// The order stays as history, and the card is back on sale.
+app.MapPost("/api/orders/{orderId:int}/cancel", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
+    ChangeOrderStatusAsync(orderId, principal, request, config, logger, OrderParty.Either, from: "pending", to: "cancelled"))
+.RequireAuthorization()
+.WithName("CancelOrder");
 
 // ---- Reviews: one per order, written by the buyer once they have received the card ----
 
@@ -1170,9 +1224,9 @@ static async Task<IResult> QueryAsync(IConfiguration config, ILogger logger, str
     }
 }
 
-// Moves an order one step on. Only the card's seller ships, and only the buyer confirms receipt.
+// Moves an order one step on. Only the card's seller ships, only the buyer confirms receipt, and either may cancel.
 static Task<IResult> ChangeOrderStatusAsync(int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config,
-    ILogger logger, bool asSeller, string from, string to)
+    ILogger logger, OrderParty party, string from, string to)
 {
     if (CurrentUserId(principal) is not int userId)
     {
@@ -1183,7 +1237,12 @@ static Task<IResult> ChangeOrderStatusAsync(int orderId, ClaimsPrincipal princip
         await using (var command = new SqlCommand(
             $"""
             SELECT o.order_status FROM ORDERS o JOIN CARDS c ON c.card_id = o.card_id
-            WHERE o.order_id = @orderId AND {(asSeller ? "c.seller_id" : "o.user_id")} = @userId
+            WHERE o.order_id = @orderId AND {party switch
+            {
+                OrderParty.Seller => "c.seller_id = @userId",
+                OrderParty.Buyer => "o.user_id = @userId",
+                _ => "(c.seller_id = @userId OR o.user_id = @userId)",
+            }}
             """,
             connection))
         {
@@ -1196,9 +1255,12 @@ static Task<IResult> ChangeOrderStatusAsync(int orderId, ClaimsPrincipal princip
             }
             if (status != from)
             {
-                return Results.Conflict(new { message = to == "shipped"
-                    ? "This order has already been shipped"
-                    : "This order cannot be marked as received yet" });
+                return Results.Conflict(new { message = to switch
+                {
+                    "shipped" => "This order has already been shipped or cancelled",
+                    "cancelled" => "Only an order that has not been shipped yet can be cancelled",
+                    _ => "This order cannot be marked as received yet",
+                } });
             }
         }
 
@@ -1513,6 +1575,8 @@ record CardListing(
 record UpdateListingRequest(decimal? CardPrice, string? CardDescription);
 
 // One order. PaymentSlip is the address of the slip picture, which only the buyer and seller can open.
+enum OrderParty { Seller, Buyer, Either }
+
 record Order(int OrderId, int CardId, string BuyerName, string OrderStatus, decimal OrderPrice, string? PaymentSlip);
 
 // An order for one of the seller's cards, with what the seller needs to send it.
