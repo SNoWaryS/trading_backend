@@ -7,17 +7,12 @@ using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-// Allow the Angular dev server to call this API from the browser, sending the session cookie.
 builder.Services.AddCors(options =>
     options.AddDefaultPolicy(policy =>
         policy.WithOrigins("http://localhost:4200").AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
-// Session: an encrypted, HttpOnly cookie set at login. JavaScript cannot read it, and SameSite=Strict
-// keeps other sites from sending it, which also protects the API from cross-site request forgery.
 builder.Services
     .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(options =>
@@ -25,10 +20,9 @@ builder.Services
         options.Cookie.Name = "trading_session";
         options.Cookie.HttpOnly = true;
         options.Cookie.SameSite = SameSiteMode.Strict;
-        options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest; // Always use HTTPS in production.
+        options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
         options.ExpireTimeSpan = TimeSpan.FromDays(7);
         options.SlidingExpiration = true;
-        // An API answers 401/403 instead of redirecting to a login page.
         options.Events.OnRedirectToLogin = context =>
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -39,7 +33,6 @@ builder.Services
             context.Response.StatusCode = StatusCodes.Status403Forbidden;
             return Task.CompletedTask;
         };
-        // A deleted account's sessions stop working at once, on every device, not only in the browser that deleted it.
         options.Events.OnValidatePrincipal = async context =>
         {
             if (!int.TryParse(context.Principal?.FindFirstValue(ClaimTypes.NameIdentifier), out var userId))
@@ -63,7 +56,6 @@ builder.Services
             }
             catch (SqlException)
             {
-                // Keep the session; the endpoint itself reports that the database cannot be reached.
             }
         };
     });
@@ -73,9 +65,7 @@ var app = builder.Build();
 
 app.UseCors();
 
-// Card photos sellers upload, served at /uploads/... (the folder is not committed to git).
 const string UploadsFolder = "uploads";
-// Files only some users may see, such as payment slips. Never served as static files (also not committed to git).
 const string PrivateFolder = "private";
 var uploadsPath = Path.Combine(app.Environment.ContentRootPath, UploadsFolder);
 Directory.CreateDirectory(uploadsPath);
@@ -88,7 +78,6 @@ app.UseStaticFiles(new StaticFileOptions
 app.UseAuthentication();
 app.UseAuthorization();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
@@ -96,26 +85,6 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
-
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast");
-
-// Connection check: front -> back -> SQL Server.
 app.MapGet("/api/health", async (IConfiguration config, ILogger<Program> logger) =>
 {
     try
@@ -137,7 +106,6 @@ app.MapGet("/api/health", async (IConfiguration config, ILogger<Program> logger)
 .WithName("GetHealth");
 
 var passwordHasher = new PasswordHasher<string>();
-// Verified when the username is unknown, so both failures take about the same time.
 var unknownUserHash = passwordHasher.HashPassword(string.Empty, Guid.NewGuid().ToString());
 
 app.MapPost("/api/auth/login", async (LoginRequest request, HttpContext http, IConfiguration config, ILogger<Program> logger) =>
@@ -241,7 +209,7 @@ app.MapPost("/api/auth/register", async (RegisterRequest request, IConfiguration
         var userId = (int)(await command.ExecuteScalarAsync())!;
         return Results.Created($"/api/users/{userId}", new { userId, username });
     }
-    catch (SqlException ex) when (ex.Number is 2601 or 2627) // unique constraint violation
+    catch (SqlException ex) when (ex.Number is 2601 or 2627)
     {
         var message = ex.Message.Contains("UQ_USERS_email", StringComparison.OrdinalIgnoreCase)
             ? "This email is already registered"
@@ -256,7 +224,6 @@ app.MapPost("/api/auth/register", async (RegisterRequest request, IConfiguration
 })
 .WithName("Register");
 
-// The logged-in user, from the session cookie. 401 when there is no valid session.
 app.MapGet("/api/auth/me", async (ClaimsPrincipal principal, HttpContext http, IConfiguration config, ILogger<Program> logger) =>
 {
     if (!int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var userId))
@@ -272,7 +239,6 @@ app.MapGet("/api/auth/me", async (ClaimsPrincipal principal, HttpContext http, I
         var profile = await LoadProfileAsync(connection, userId);
         if (profile is null)
         {
-            // The account no longer exists, so the session is no longer valid.
             await http.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
             return Results.Unauthorized();
         }
@@ -287,7 +253,6 @@ app.MapGet("/api/auth/me", async (ClaimsPrincipal principal, HttpContext http, I
 .RequireAuthorization()
 .WithName("GetCurrentUser");
 
-// Ends the session by removing the cookie. Safe to call without a session.
 app.MapPost("/api/auth/logout", async (HttpContext http) =>
 {
     await http.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
@@ -295,7 +260,6 @@ app.MapPost("/api/auth/logout", async (HttpContext http) =>
 })
 .WithName("Logout");
 
-// A seller's public details, for their profile page. 404 when nobody has this username or the account was deleted.
 app.MapGet("/api/users/{username}", (string username, IConfiguration config, ILogger<Program> logger) =>
     QueryAsync(config, logger, "Loading a public profile", async connection =>
     {
@@ -323,7 +287,6 @@ app.MapGet("/api/users/{username}", (string username, IConfiguration config, ILo
 .RequireAuthorization()
 .WithName("GetPublicProfile");
 
-// Changes the logged-in user's own details. The username stays fixed because orders and reviews show it.
 app.MapPut("/api/users/me", async (UpdateProfileRequest request, ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int userId)
@@ -364,7 +327,7 @@ app.MapPut("/api/users/me", async (UpdateProfileRequest request, ClaimsPrincipal
                 return Results.Unauthorized();
             }
         }
-        catch (SqlException ex) when (ex.Number is 2601 or 2627) // UQ_USERS_email
+        catch (SqlException ex) when (ex.Number is 2601 or 2627)
         {
             return Results.Conflict(new { message = "This email is already used by another account" });
         }
@@ -374,10 +337,6 @@ app.MapPut("/api/users/me", async (UpdateProfileRequest request, ClaimsPrincipal
 .RequireAuthorization()
 .WithName("UpdateProfile");
 
-// Deletes the logged-in user's account after they confirm with their password. Sign-in stops working at once,
-// cards nobody has ordered are taken off sale, and the rest is removed 30 days later (PurgeDeletedAccountsAsync).
-// Not allowed while one of their orders, as buyer or seller, is still pending or shipped: the other person still
-// needs to reach them.
 app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, HttpContext http, ClaimsPrincipal principal,
     IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
 {
@@ -408,8 +367,6 @@ app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, H
 
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync();
 
-        // Takes the cards nobody has ordered off sale first. Someone buying one of them now waits for this
-        // transaction and then fails, and an order placed just before is caught by the check below.
         var pictures = new List<string?>();
         var slips = new List<string?>();
         await using (var remove = new SqlCommand(
@@ -451,7 +408,7 @@ app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, H
             open.Parameters.AddWithValue("@userId", userId);
             if ((int)(await open.ExecuteScalarAsync())! > 0)
             {
-                await transaction.RollbackAsync(); // puts the cards back on sale
+                await transaction.RollbackAsync();
                 return Results.Conflict(new
                 {
                     message = "You still have orders that are not finished. Wait until every order you bought or sold is received, then try again.",
@@ -482,7 +439,6 @@ app.MapDelete("/api/users/me", async ([FromBody] DeleteAccountRequest request, H
 .RequireAuthorization()
 .WithName("DeleteAccount");
 
-// Removes accounts deleted more than 30 days ago: once when the API starts, then every hour while it runs.
 app.Lifetime.ApplicationStarted.Register(() => _ = Task.Run(async () =>
 {
     var stopping = app.Lifetime.ApplicationStopping;
@@ -503,12 +459,9 @@ app.Lifetime.ApplicationStarted.Register(() => _ = Task.Run(async () =>
     }
     catch (OperationCanceledException)
     {
-        // The API is shutting down.
     }
 }));
 
-// Searches the card catalog (the cards that may be sold) by card name, set or number.
-// Returns at most `limit` cards (default 50, up to 100), sorted by name, so the add card form stays fast.
 const string CatalogColumns =
     "catalog_id, card_name, set_name, card_number, card_type, rarity, card_stage, card_element, card_picture, reference_price";
 
@@ -584,11 +537,8 @@ app.MapGet("/api/catalog/{catalogId:int}", async (int catalogId, IConfiguration 
 .RequireAuthorization()
 .WithName("GetCatalogCard");
 
-// ---- Listings: a seller offering one catalog card (the CARDS table) ----
-
 const int MaxDescriptionLength = 1000;
 const long MaxPictureBytes = 5 * 1024 * 1024;
-// Column order is what ReadListing expects.
 const string ListingSelect =
     """
     SELECT c.card_id, c.catalog_id, k.card_name, u.username, k.card_type, k.rarity, k.reference_price,
@@ -599,7 +549,6 @@ const string ListingSelect =
     JOIN USERS u ON u.user_id = c.seller_id
     """;
 
-// All listings, newest first. With ?seller=username, only that seller's.
 app.MapGet("/api/listings", async (string? seller, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
 {
     try
@@ -648,11 +597,6 @@ app.MapGet("/api/listings/{cardId:int}", async (int cardId, HttpRequest request,
 .RequireAuthorization()
 .WithName("GetListing");
 
-// Cards for sale like what the user searched for, by vector similarity (see CardVectors.cs), for the Home page.
-// The search vector is the average of the vectors of the cards whose name contains `search` (and that have
-// `element`, when given). Cards for sale are tried first; when none match, the catalog is used, so a card nobody
-// is selling still gets suggestions. The result leaves out the matching cards themselves (Home already shows
-// them), sold cards and the logged-in user's own cards. `limit` defaults to 4, up to 12.
 app.MapGet("/api/listings/similar", (string? search, string? element, int? limit, ClaimsPrincipal principal,
     HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
 {
@@ -683,7 +627,6 @@ app.MapGet("/api/listings/similar", (string? search, string? element, int? limit
             }
         }
 
-        // The same match as the Home page's search, so "matching" here means the cards Home shows.
         var matching = forSale.Where((card) => Named(card.CardName) && HasElement(card.CardElement)).ToList();
         var basedOn = "listings";
         var vectors = matching.Select(CardVectors.ToVector).ToList();
@@ -723,9 +666,6 @@ app.MapGet("/api/listings/similar", (string? search, string? element, int? limit
 .RequireAuthorization()
 .WithName("GetSimilarListings");
 
-// Lists a catalog card for sale. multipart/form-data: catalogId, cardPrice, cardDescription (optional), photo (optional).
-// The form is read by hand, so no antiforgery token is involved; the SameSite=Strict session cookie already
-// keeps other sites from posting here.
 app.MapPost("/api/listings", async (HttpRequest request, ClaimsPrincipal principal, IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
 {
     if (!int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var sellerId))
@@ -760,7 +700,6 @@ app.MapPost("/api/listings", async (HttpRequest request, ClaimsPrincipal princip
         await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
         await connection.OpenAsync();
 
-        // Only catalog cards can be sold.
         await using (var exists = new SqlCommand("SELECT 1 FROM CARD_CATALOG WHERE catalog_id = @catalogId", connection))
         {
             exists.Parameters.AddWithValue("@catalogId", catalogId);
@@ -804,7 +743,6 @@ app.MapPost("/api/listings", async (HttpRequest request, ClaimsPrincipal princip
 .RequireAuthorization()
 .WithName("AddListing");
 
-// Changes the price and description of the logged-in user's own listing.
 app.MapPut("/api/listings/{cardId:int}", async (int cardId, UpdateListingRequest body, HttpRequest request, ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
 {
     if (!int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var sellerId))
@@ -853,7 +791,6 @@ app.MapPut("/api/listings/{cardId:int}", async (int cardId, UpdateListingRequest
             sold = reader.GetBoolean(1);
         }
 
-        // Someone else's listing looks the same as a missing one. A sold card keeps the price the buyer paid.
         return changed > 0 ? Results.Ok(await LoadListingAsync(connection, cardId, request))
             : sold ? Results.Conflict(new { message = "This card has been sold, so it cannot be changed" })
             : Results.NotFound(new { message = "You have no such card for sale" });
@@ -867,7 +804,6 @@ app.MapPut("/api/listings/{cardId:int}", async (int cardId, UpdateListingRequest
 .RequireAuthorization()
 .WithName("UpdateListing");
 
-// Removes the logged-in user's own listing, unless someone has already ordered it.
 app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal principal, IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
 {
     if (!int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var sellerId))
@@ -880,8 +816,6 @@ app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal p
         await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
         await connection.OpenAsync();
 
-        // Cancelled orders go with the card. An order that is still active makes the DELETE fail (547), and
-        // XACT_ABORT then rolls the whole batch back.
         await using var command = new SqlCommand(
             """
             SET XACT_ABORT ON;
@@ -924,7 +858,7 @@ app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal p
         }
         return Results.NoContent();
     }
-    catch (SqlException ex) when (ex.Number == 547) // an order refers to this card
+    catch (SqlException ex) when (ex.Number == 547)
     {
         return Results.Conflict(new { message = "Someone has ordered this card, so it cannot be removed" });
     }
@@ -937,12 +871,7 @@ app.MapDelete("/api/listings/{cardId:int}", async (int cardId, ClaimsPrincipal p
 .RequireAuthorization()
 .WithName("DeleteListing");
 
-// ---- Orders: a buyer ordering one listing, paid by bank transfer with a payment slip ----
-// pending -> shipped (the seller checked the slip and sent the card) -> received (the buyer confirmed it arrived).
-// A pending order may be cancelled by either side instead; the card then goes back on sale.
-
 const int MaxReviewLength = 500;
-// Column order is what ReadReview expects; card_id (5) is for finding the card a review is about.
 const string ReviewSelect =
     """
     SELECT r.review_id, r.order_id, rb.username, r.review_status, r.comment, o.card_id
@@ -950,7 +879,6 @@ const string ReviewSelect =
     JOIN USERS rb ON rb.user_id = r.buyer_id
     JOIN ORDERS o ON o.order_id = r.order_id
     """;
-// Column order is what ReadOrder and ReadSale expect.
 const string OrderSelect =
     """
     SELECT o.order_id, o.card_id, b.username, o.order_status, o.order_price, o.payment_slip,
@@ -960,7 +888,6 @@ const string OrderSelect =
     JOIN CARDS c ON c.card_id = o.card_id
     """;
 
-// The logged-in user's orders, newest first.
 app.MapGet("/api/orders/mine", async (ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int userId)
@@ -983,7 +910,6 @@ app.MapGet("/api/orders/mine", async (ClaimsPrincipal principal, HttpRequest req
 .RequireAuthorization()
 .WithName("GetMyOrders");
 
-// Orders for the logged-in user's cards, newest first, with the buyer's contact details and address for shipping.
 app.MapGet("/api/orders/sales", async (ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int userId)
@@ -1006,8 +932,6 @@ app.MapGet("/api/orders/sales", async (ClaimsPrincipal principal, HttpRequest re
 .RequireAuthorization()
 .WithName("GetMySales");
 
-// Orders a card. multipart/form-data: cardId and slip (the payment slip picture, required).
-// The price is the listing's price now, not one the browser sends.
 app.MapPost("/api/orders", async (HttpRequest request, ClaimsPrincipal principal, IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int buyerId)
@@ -1076,7 +1000,7 @@ app.MapPost("/api/orders", async (HttpRequest request, ClaimsPrincipal principal
         var orderId = (int)(await command.ExecuteScalarAsync())!;
         return Results.Created($"/api/orders/{orderId}", await LoadOrderAsync(connection, orderId, request));
     }
-    catch (SqlException ex) when (ex.Number is 2601 or 2627) // UQ_ORDERS_card: someone ordered it first
+    catch (SqlException ex) when (ex.Number is 2601 or 2627)
     {
         DeleteSlip(slipName, env);
         return Results.Conflict(new { message = "Sorry, someone has already bought this card" });
@@ -1091,7 +1015,6 @@ app.MapPost("/api/orders", async (HttpRequest request, ClaimsPrincipal principal
 .RequireAuthorization()
 .WithName("PlaceOrder");
 
-// The payment slip picture, for the order's buyer and the card's seller only.
 app.MapGet("/api/orders/{orderId:int}/slip", async (int orderId, ClaimsPrincipal principal, IWebHostEnvironment env, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int userId)
@@ -1121,28 +1044,21 @@ app.MapGet("/api/orders/{orderId:int}/slip", async (int orderId, ClaimsPrincipal
 .RequireAuthorization()
 .WithName("GetPaymentSlip");
 
-// The seller checked the payment and sent the card.
 app.MapPost("/api/orders/{orderId:int}/ship", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
     ChangeOrderStatusAsync(orderId, principal, request, config, logger, OrderParty.Seller, from: "pending", to: "shipped"))
 .RequireAuthorization()
 .WithName("ShipOrder");
 
-// The buyer confirmed the card arrived, which unlocks the review.
 app.MapPost("/api/orders/{orderId:int}/receive", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
     ChangeOrderStatusAsync(orderId, principal, request, config, logger, OrderParty.Buyer, from: "shipped", to: "received"))
 .RequireAuthorization()
 .WithName("ReceiveOrder");
 
-// The buyer or the seller calls off an order that has not been shipped, for example when the payment slip is wrong.
-// The order stays as history, and the card is back on sale.
 app.MapPost("/api/orders/{orderId:int}/cancel", (int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
     ChangeOrderStatusAsync(orderId, principal, request, config, logger, OrderParty.Either, from: "pending", to: "cancelled"))
 .RequireAuthorization()
 .WithName("CancelOrder");
 
-// ---- Reviews: one per order, written by the buyer once they have received the card ----
-
-// Reviews on the logged-in user's own orders.
 app.MapGet("/api/reviews/mine", async (ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int userId)
@@ -1167,7 +1083,6 @@ app.MapGet("/api/reviews/mine", async (ClaimsPrincipal principal, IConfiguration
 .RequireAuthorization()
 .WithName("GetMyReviews");
 
-// Reviews buyers wrote on orders for this seller's cards, newest first, each with the card it was for.
 app.MapGet("/api/reviews", async (string? seller, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
 {
     if (string.IsNullOrWhiteSpace(seller))
@@ -1209,7 +1124,6 @@ app.MapGet("/api/reviews", async (string? seller, HttpRequest request, IConfigur
 .RequireAuthorization()
 .WithName("GetSellerReviews");
 
-// The buyer reviews a received order, once. JSON: { comment }.
 app.MapPost("/api/orders/{orderId:int}/review", async (int orderId, AddReviewRequest body, ClaimsPrincipal principal, IConfiguration config, ILogger<Program> logger) =>
 {
     if (CurrentUserId(principal) is not int userId)
@@ -1247,7 +1161,6 @@ app.MapPost("/api/orders/{orderId:int}/review", async (int orderId, AddReviewReq
             return Results.Conflict(new { message = "Confirm receipt before reviewing this order" });
         }
 
-        // A 'not_reviewed' row may already exist for the order; it becomes the review. A 'reviewed' one cannot change.
         await using var command = new SqlCommand(
             $"""
             UPDATE REVIEWS SET comment = @comment, review_status = N'reviewed'
@@ -1265,7 +1178,7 @@ app.MapPost("/api/orders/{orderId:int}/review", async (int orderId, AddReviewReq
         await reader.ReadAsync();
         return Results.Created($"/api/orders/{orderId}/review", ReadReview(reader));
     }
-    catch (SqlException ex) when (ex.Number is 2601 or 2627) // UQ_REVIEWS_order
+    catch (SqlException ex) when (ex.Number is 2601 or 2627)
     {
         return Results.Conflict(new { message = "This order has already been reviewed" });
     }
@@ -1283,7 +1196,6 @@ app.Run();
 static int? CurrentUserId(ClaimsPrincipal principal) =>
     int.TryParse(principal.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : null;
 
-// Opens a connection and runs a read; a database error becomes a 503 like everywhere else.
 static async Task<IResult> QueryAsync(IConfiguration config, ILogger logger, string what, Func<SqlConnection, Task<IResult>> run)
 {
     try
@@ -1299,7 +1211,6 @@ static async Task<IResult> QueryAsync(IConfiguration config, ILogger logger, str
     }
 }
 
-// Moves an order one step on. Only the card's seller ships, only the buyer confirms receipt, and either may cancel.
 static Task<IResult> ChangeOrderStatusAsync(int orderId, ClaimsPrincipal principal, HttpRequest request, IConfiguration config,
     ILogger logger, OrderParty party, string from, string to)
 {
@@ -1372,7 +1283,6 @@ static Order ReadOrder(SqlDataReader reader, HttpRequest request)
         reader.GetString(2),
         reader.GetString(3),
         reader.GetDecimal(4),
-        // The slip is only sent through the slip endpoint, which checks who is asking.
         reader.IsDBNull(5) ? null : $"{request.Scheme}://{request.Host}/api/orders/{orderId}/slip");
 }
 
@@ -1401,7 +1311,6 @@ static void DeleteSlip(string? name, IWebHostEnvironment env)
     }
 }
 
-// A listing joined with its catalog card and seller. card_picture is the seller's photo, or the catalog picture without one.
 static async Task<CardListing?> LoadListingAsync(SqlConnection connection, int cardId, HttpRequest request)
 {
     await using var command = new SqlCommand($"{ListingSelect} WHERE c.card_id = @cardId", connection);
@@ -1413,7 +1322,6 @@ static async Task<CardListing?> LoadListingAsync(SqlConnection connection, int c
 static CardListing ReadListing(SqlDataReader reader, HttpRequest request)
 {
     string? Text(int i) => reader.IsDBNull(i) ? null : reader.GetString(i);
-    // Uploaded photos are stored as a path on this API; the browser needs the full address.
     var photo = Text(9);
     var picture = photo is null ? Text(10) : $"{request.Scheme}://{request.Host}{photo}";
     return new CardListing(
@@ -1432,7 +1340,6 @@ static CardListing ReadListing(SqlDataReader reader, HttpRequest request)
         reader.GetBoolean(13));
 }
 
-// The price must be a whole number of baht from 1 to the largest that fits DECIMAL(12,2).
 static string? ListingPriceError(string? value, out decimal price)
 {
     if (!decimal.TryParse(value, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out price))
@@ -1444,7 +1351,6 @@ static string? ListingPriceError(string? value, out decimal price)
         : null;
 }
 
-// JPG, PNG or WebP up to 5 MB, checked by the file's first bytes rather than the name the browser sent.
 static async Task<string?> PictureErrorAsync(IFormFile file)
 {
     if (file.Length == 0 || file.Length > MaxPictureBytes)
@@ -1465,11 +1371,9 @@ static async Task<string?> PictureExtensionAsync(IFormFile file)
     return null;
 }
 
-// Saves an uploaded picture under uploads/listings with a random name and returns its path on this API.
 static async Task<string> SavePictureAsync(IFormFile file, IWebHostEnvironment env) =>
     $"/{UploadsFolder}/listings/{await SaveFileAsync(file, Path.Combine(env.ContentRootPath, UploadsFolder, "listings"))}";
 
-// Saves a picture in the folder with a random name and returns the name.
 static async Task<string> SaveFileAsync(IFormFile file, string folder)
 {
     var extension = await PictureExtensionAsync(file) ?? throw new InvalidOperationException("Not a picture");
@@ -1482,7 +1386,6 @@ static async Task<string> SaveFileAsync(IFormFile file, string folder)
     return name;
 }
 
-// Payment slips are private: they live outside the public uploads folder and are only sent to the buyer and seller.
 static string SlipFolder(IWebHostEnvironment env) => Path.Combine(env.ContentRootPath, PrivateFolder, "slips");
 
 static void DeletePicture(string? path, IWebHostEnvironment env)
@@ -1498,7 +1401,6 @@ static void DeletePicture(string? path, IWebHostEnvironment env)
     }
 }
 
-// LIKE treats %, _ and [ as wildcards; escape them so they match themselves.
 static string EscapeLike(string value) =>
     value.Replace(@"\", @"\\").Replace("%", @"\%").Replace("_", @"\_").Replace("[", @"\[");
 
@@ -1518,8 +1420,6 @@ static CatalogCard ReadCatalogCard(SqlDataReader reader)
         reader.IsDBNull(9) ? null : reader.GetDecimal(9));
 }
 
-// The details a user enters at registration and may change later. Same limits as the USERS table.
-// Phone number and address are required: buyers and sellers contact each other by phone, and sellers ship to the address.
 static string? ProfileError(string name, string surname, string email, string phoneNumber, string address) =>
     name.Length == 0 || surname.Length == 0 || email.Length == 0 || phoneNumber.Length == 0 || address.Length == 0
         ? "Please fill in all required fields"
@@ -1529,14 +1429,10 @@ static string? ProfileError(string name, string surname, string email, string ph
     : address.Length > 500 ? "Address must be 500 characters or fewer"
     : null;
 
-// Digits, with spaces, dashes or a leading + allowed between them, e.g. 081-234-5678 or +66 81 234 5678.
 static bool IsValidPhoneNumber(string phoneNumber) =>
     System.Text.RegularExpressions.Regex.IsMatch(phoneNumber, @"^\+?[0-9][0-9 -]*[0-9]$")
     && phoneNumber.Count(char.IsAsciiDigit) is >= 9 and <= 15;
 
-// Removes accounts deleted more than 30 days ago, with their activity, as the privacy policy promises: their cards,
-// the orders they placed or received and the reviews on those orders, and the photos and slips those point to.
-// Cards a deleted user bought go too, because a card whose order is gone would be back on sale.
 static async Task PurgeDeletedAccountsAsync(IConfiguration config, IWebHostEnvironment env, ILogger logger)
 {
     await using var connection = new SqlConnection(config.GetConnectionString("DefaultConnection"));
@@ -1593,7 +1489,6 @@ static async Task PurgeDeletedAccountsAsync(IConfiguration config, IWebHostEnvir
 static bool IsValidEmail(string email) =>
     System.Net.Mail.MailAddress.TryCreate(email, out var parsed) && parsed.Address == email;
 
-// Everything about a user except the password hash.
 static async Task<UserProfile?> LoadProfileAsync(SqlConnection connection, int userId)
 {
     await using var command = new SqlCommand(
@@ -1638,7 +1533,6 @@ record CatalogCard(
     string? CardPicture,
     decimal? ReferencePrice);
 
-// One listing as the pages show it. CardPicture is the seller's photo, or the catalog picture without one.
 record CardListing(
     int CardId,
     int CatalogId,
@@ -1652,24 +1546,18 @@ record CardListing(
     string? CardElement,
     string? CardPicture,
     string? CardDescription,
-    bool Sold); // someone has ordered it
+    bool Sold);
 
-// A card for sale and how alike it is to another card, from 0 (nothing alike) to 1 (alike in every way).
 record SimilarCard(CardListing Card, double Similarity);
 
-// Cards like a search. BasedOn says which cards the search vector came from: "listings" (cards for sale whose name
-// matched), "catalog" (none for sale, so catalog cards whose name matched) or "none" (nothing matched).
-// Matches is how many cards were averaged into the search vector.
 record SimilarSearch(string BasedOn, int Matches, List<SimilarCard> Cards);
 
 record UpdateListingRequest(decimal? CardPrice, string? CardDescription);
 
-// One order. PaymentSlip is the address of the slip picture, which only the buyer and seller can open.
 enum OrderParty { Seller, Buyer, Either }
 
 record Order(int OrderId, int CardId, string BuyerName, string OrderStatus, decimal OrderPrice, string? PaymentSlip);
 
-// An order for one of the seller's cards, with what the seller needs to send it.
 record Sale(int OrderId, int CardId, string BuyerName, string OrderStatus, decimal OrderPrice, string? PaymentSlip, BuyerContact Buyer);
 
 record BuyerContact(string Name, string Surname, string Email, string? PhoneNumber, string? Address);
@@ -1682,7 +1570,6 @@ record AddReviewRequest(string? Comment);
 
 record LoginRequest(string? Username, string? Password);
 
-// What other users may see about a seller, so buyers can contact them. The address stays private.
 record PublicProfile(int UserId, string Name, string Surname, string Username, string Email, string? PhoneNumber);
 
 record UpdateProfileRequest(string? Name, string? Surname, string? Email, string? PhoneNumber, string? Address);
@@ -1697,8 +1584,3 @@ record RegisterRequest(
     string? Password,
     string? PhoneNumber,
     string? Address);
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
